@@ -1,0 +1,514 @@
+import pandas as pd
+import requests
+import time
+import os
+from bs4 import BeautifulSoup
+import yfinance as yf
+from dotenv import load_dotenv
+import logging
+from supabase import create_client, Client
+import json
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Load environment variables
+load_dotenv()
+
+# Supabase credentials
+SUPABASE_URL = os.getenv('SUPABASE_URL')
+SUPABASE_KEY = os.getenv('SUPABASE_KEY')
+
+# API keys for enrichment
+CLEARBIT_API_KEY = os.getenv('CLEARBIT_API_KEY')
+ALPHA_VANTAGE_API_KEY = os.getenv('ALPHA_VANTAGE_API_KEY')
+
+# Initialize Clearbit if API key is available
+if CLEARBIT_API_KEY:
+    from clearbit.error import ClearbitError
+    import clearbit
+    clearbit.key = CLEARBIT_API_KEY
+
+class CompanyDataEnricher:
+    def __init__(self):
+        """Initialize with Supabase connection."""
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            raise ValueError("Missing Supabase credentials. Please set SUPABASE_URL and SUPABASE_KEY in .env file")
+        
+        self.supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        self.missing_value_marker = "Not found"
+        self.df = None
+        
+    def retrieve_data(self):
+        """Retrieve company data from Supabase."""
+        logger.info("Retrieving company data from Supabase")
+        
+        try:
+            # Fetch all rows from the company_information table
+            response = self.supabase.table('company_information').select('*').execute()
+            
+            if hasattr(response, 'data') and response.data:
+                # Convert to DataFrame
+                self.df = pd.DataFrame(response.data)
+                logger.info(f"Retrieved {len(self.df)} companies from Supabase")
+                return True
+            else:
+                logger.error("No data retrieved from Supabase")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error retrieving data from Supabase: {e}")
+            return False
+    
+    def process_data(self):
+        """Process the retrieved data and fill in missing information."""
+        if self.df is None or len(self.df) == 0:
+            logger.error("No data to process")
+            return False
+            
+        # Count missing values before enrichment
+        missing_before = self._count_missing_values()
+        logger.info(f"Missing values before enrichment: {missing_before}")
+        
+        # Process each row
+        for index, row in self.df.iterrows():
+            company_name = row.get('Company Name')
+            if not company_name or pd.isna(company_name):
+                logger.warning(f"Row {index}: Company name missing, skipping")
+                continue
+                
+            logger.info(f"Processing company: {company_name} (row {index+1})")
+            self._enrich_company_data(index, company_name)
+            
+            # Sleep to avoid rate limiting
+            time.sleep(1)
+        
+        # Count missing values after enrichment
+        missing_after = self._count_missing_values()
+        logger.info(f"Missing values after enrichment: {missing_after}")
+        logger.info(f"Filled {missing_before - missing_after} missing values")
+        
+        return True
+        
+    def save_to_excel(self, output_file='enriched_companies.xlsx'):
+        """Save the enriched data to an Excel file."""
+        if self.df is None or len(self.df) == 0:
+            logger.error("No data to save")
+            return None
+            
+        try:
+            self.df.to_excel(output_file, index=False)
+            logger.info(f"Saved enriched data to {output_file}")
+            return output_file
+        except Exception as e:
+            logger.error(f"Error saving to Excel: {e}")
+            return None
+            
+    def update_supabase(self):
+        """Update the Supabase table with enriched data."""
+        if self.df is None or len(self.df) == 0:
+            logger.error("No data to update in Supabase")
+            return False
+            
+        try:
+            # For each row, update the corresponding record in Supabase
+            update_count = 0
+            for index, row in self.df.iterrows():
+                record_id = row.get('id')
+                if not record_id:
+                    logger.warning(f"Row {index}: No ID found, cannot update")
+                    continue
+                    
+                # Convert row to dict, excluding the id field
+                update_data = row.drop('id').to_dict()
+                
+                # Update the record in Supabase
+                self.supabase.table('company_information').update(update_data).eq('id', record_id).execute()
+                update_count += 1
+                
+            logger.info(f"Updated {update_count} records in Supabase")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error updating Supabase: {e}")
+            return False
+    
+    def _count_missing_values(self):
+        """Count how many missing values are in the dataframe."""
+        return ((self.df == self.missing_value_marker) | self.df.isna()).sum().sum()
+        
+    def _enrich_company_data(self, index, company_name):
+        """Enrich data for a single company using multiple sources."""
+        ticker = self._find_ticker(company_name)
+        
+        # Enrich with different data sources
+        self._enrich_with_clearbit(index, company_name)
+        self._enrich_with_yahoo_finance(index, company_name, ticker)
+        self._enrich_with_alpha_vantage(index, company_name, ticker)
+        self._enrich_with_web_scraping(index, company_name)
+    
+    def _find_ticker(self, company_name):
+        """Try to find stock ticker for the company."""
+        try:
+            # Search for ticker using yfinance
+            tickers = yf.Tickers(company_name)
+            if tickers and hasattr(tickers, 'tickers'):
+                for ticker_symbol, ticker_obj in tickers.tickers.items():
+                    if ticker_obj.info and 'shortName' in ticker_obj.info:
+                        return ticker_symbol
+            return None
+        except Exception as e:
+            logger.warning(f"Error finding ticker for {company_name}: {e}")
+            return None
+    
+    def _enrich_with_clearbit(self, index, company_name):
+        """Enrich data using Clearbit API."""
+        if not CLEARBIT_API_KEY:
+            return
+            
+        try:
+            # Query Clearbit for company information
+            # First try with domain if Website is available
+            domain = None
+            if 'Website' in self.df.columns and not pd.isna(self.df.loc[index, 'Website']):
+                website = self.df.loc[index, 'Website']
+                if website and website != self.missing_value_marker:
+                    # Extract domain from website URL
+                    from urllib.parse import urlparse
+                    parsed_url = urlparse(website)
+                    domain = parsed_url.netloc or website
+            
+            # Now query Clearbit
+            result = clearbit.Company.find(name=company_name, domain=domain)
+            
+            if result:
+                # Map Clearbit fields to your DataFrame columns
+                field_mapping = {
+                    'description': 'Description',
+                    'category.industry': 'Industry',
+                    'tech_categories': 'Software Classification',  # This is an approximation
+                    'geo.country': 'Country',
+                    'geo.city': 'City',
+                    'geo.streetNumber': 'Street Address',
+                    'geo.postalCode': 'Postal Code',
+                    'site.phoneNumbers': 'Phone',
+                    'site.emailAddresses': 'Email',
+                    'metrics.employees': 'Employee Count',
+                    'metrics.marketCap': 'Financial Info',  # Partial info
+                    'parent.domain': 'Parent Company'  # Approximation
+                }
+                
+                for api_field, df_column in field_mapping.items():
+                    if df_column in self.df.columns:
+                        # Use nested dict access for fields like 'metrics.employees'
+                        value = result
+                        for key in api_field.split('.'):
+                            if isinstance(value, dict) and key in value:
+                                value = value[key]
+                            else:
+                                value = None
+                                break
+                                
+                        # Special handling for array fields
+                        if api_field == 'site.phoneNumbers' and isinstance(value, list) and value:
+                            value = value[0]  # Take first phone number
+                        elif api_field == 'site.emailAddresses' and isinstance(value, list) and value:
+                            value = value[0]  # Take first email
+
+                        # Update if we have a value and current value is missing
+                        current_value = self.df.loc[index, df_column]
+                        if value and (pd.isna(current_value) or current_value == self.missing_value_marker):
+                            self.df.loc[index, df_column] = value
+                            logger.info(f"Updated {df_column} for {company_name} with Clearbit data")
+                
+                # Special handling for Geography field which is a combination
+                if 'Geography' in self.df.columns:
+                    geo_parts = []
+                    if 'geo' in result:
+                        if 'city' in result['geo'] and result['geo']['city']:
+                            geo_parts.append(result['geo']['city'])
+                        if 'state' in result['geo'] and result['geo']['state']:
+                            geo_parts.append(result['geo']['state'])
+                        if 'country' in result['geo'] and result['geo']['country']:
+                            geo_parts.append(result['geo']['country'])
+                    
+                    if geo_parts:
+                        combined_geo = ', '.join(geo_parts)
+                        current_value = self.df.loc[index, 'Geography']
+                        if pd.isna(current_value) or current_value == self.missing_value_marker:
+                            self.df.loc[index, 'Geography'] = combined_geo
+                            logger.info(f"Updated Geography for {company_name} with Clearbit data")
+                
+        except (ClearbitError, Exception) as e:
+            logger.warning(f"Clearbit API error for {company_name}: {e}")
+    
+    def _enrich_with_yahoo_finance(self, index, company_name, ticker):
+        """Enrich data using Yahoo Finance."""
+        if not ticker:
+            return
+            
+        try:
+            ticker_data = yf.Ticker(ticker)
+            info = ticker_data.info
+            
+            # Map Yahoo Finance fields to your DataFrame columns
+            field_mapping = {
+                'longBusinessSummary': 'Description',
+                'industry': 'Industry', 
+                'country': 'Country',
+                'city': 'City',
+                'address1': 'Street Address',
+                'zip': 'Postal Code',
+                'website': 'Website',
+                'phone': 'Phone',
+                'fullTimeEmployees': 'Employee Count',
+                'sector': 'Software Classification',  # Approximation
+                'marketCap': 'Financial Info'  # Partial info
+            }
+            
+            for api_field, df_column in field_mapping.items():
+                if df_column in self.df.columns and api_field in info:
+                    current_value = self.df.loc[index, df_column]
+                    if pd.isna(current_value) or current_value == self.missing_value_marker:
+                        self.df.loc[index, df_column] = info[api_field]
+                        logger.info(f"Updated {df_column} for {company_name} with Yahoo Finance data")
+            
+            # Special handling for Geography field which is a combination
+            if 'Geography' in self.df.columns:
+                geo_parts = []
+                if 'city' in info and info['city']:
+                    geo_parts.append(info['city'])
+                if 'state' in info and info['state']:
+                    geo_parts.append(info['state'])
+                if 'country' in info and info['country']:
+                    geo_parts.append(info['country'])
+                
+                if geo_parts:
+                    combined_geo = ', '.join(geo_parts)
+                    current_value = self.df.loc[index, 'Geography']
+                    if pd.isna(current_value) or current_value == self.missing_value_marker:
+                        self.df.loc[index, 'Geography'] = combined_geo
+                        logger.info(f"Updated Geography for {company_name} with Yahoo Finance data")
+                        
+            # For Financial Info, combine several metrics
+            if 'Financial Info' in self.df.columns:
+                current_value = self.df.loc[index, 'Financial Info']
+                if pd.isna(current_value) or current_value == self.missing_value_marker:
+                    financial_data = {}
+                    financial_fields = ['marketCap', 'totalRevenue', 'grossProfits', 'ebitda', 'operatingMargins']
+                    for field in financial_fields:
+                        if field in info and info[field]:
+                            financial_data[field] = info[field]
+                    
+                    if financial_data:
+                        self.df.loc[index, 'Financial Info'] = json.dumps(financial_data)
+                        logger.info(f"Updated Financial Info for {company_name} with Yahoo Finance data")
+                        
+        except Exception as e:
+            logger.warning(f"Yahoo Finance error for {company_name} ({ticker}): {e}")
+    
+    def _enrich_with_alpha_vantage(self, index, company_name, ticker):
+        """Enrich data using Alpha Vantage API."""
+        if not ALPHA_VANTAGE_API_KEY or not ticker:
+            return
+            
+        try:
+            # Company overview
+            url = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol={ticker}&apikey={ALPHA_VANTAGE_API_KEY}"
+            response = requests.get(url)
+            data = response.json()
+            
+            # Map Alpha Vantage fields to your DataFrame columns
+            field_mapping = {
+                'Description': 'Description',
+                'Industry': 'Industry',
+                'Address': 'Street Address',
+                'Country': 'Country',
+                'Sector': 'Software Classification',  # Approximation
+                'MarketCapitalization': 'Financial Info',  # Partial info
+                'FullTimeEmployees': 'Employee Count'
+            }
+            
+            for api_field, df_column in field_mapping.items():
+                if df_column in self.df.columns and api_field in data:
+                    current_value = self.df.loc[index, df_column]
+                    if pd.isna(current_value) or current_value == self.missing_value_marker:
+                        self.df.loc[index, df_column] = data[api_field]
+                        logger.info(f"Updated {df_column} for {company_name} with Alpha Vantage data")
+                        
+            # Parse address to get city and postal code
+            if 'Address' in data and data['Address']:
+                address_parts = data['Address'].split(',')
+                if len(address_parts) >= 2 and 'City' in self.df.columns:
+                    current_value = self.df.loc[index, 'City']
+                    if pd.isna(current_value) or current_value == self.missing_value_marker:
+                        self.df.loc[index, 'City'] = address_parts[-2].strip()
+                        logger.info(f"Updated City for {company_name} with Alpha Vantage data")
+                
+                # Try to extract postal code
+                if 'Postal Code' in self.df.columns:
+                    # Simple regex for postal/zip code detection
+                    import re
+                    postal_match = re.search(r'\b\d{5}(?:-\d{4})?\b', data['Address'])
+                    if postal_match:
+                        current_value = self.df.loc[index, 'Postal Code']
+                        if pd.isna(current_value) or current_value == self.missing_value_marker:
+                            self.df.loc[index, 'Postal Code'] = postal_match.group(0)
+                            logger.info(f"Updated Postal Code for {company_name} with Alpha Vantage data")
+                            
+        except Exception as e:
+            logger.warning(f"Alpha Vantage API error for {company_name} ({ticker}): {e}")
+    
+    def _enrich_with_web_scraping(self, index, company_name):
+        """Enrich data using web scraping (fallback method)."""
+        try:
+            # Construct search query
+            search_query = f"{company_name} company information"
+            search_url = f"https://www.google.com/search?q={search_query.replace(' ', '+')}"
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            
+            response = requests.get(search_url, headers=headers)
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Extract information from Wikipedia snippets if available
+            wikipedia_link = None
+            for link in soup.find_all('a'):
+                if link.get('href') and 'wikipedia.org' in link.get('href'):
+                    wikipedia_link = link.get('href')
+                    if '/url?q=' in wikipedia_link:
+                        wikipedia_link = wikipedia_link.split('/url?q=')[1].split('&')[0]
+                    break
+            
+            if wikipedia_link:
+                wiki_response = requests.get(wikipedia_link, headers=headers)
+                wiki_soup = BeautifulSoup(wiki_response.text, 'html.parser')
+                
+                # Extract basic info from infobox
+                info_box = wiki_soup.find('table', {'class': 'infobox'})
+                if info_box:
+                    for row in info_box.find_all('tr'):
+                        header = row.find('th')
+                        data = row.find('td')
+                        if header and data:
+                            header_text = header.get_text().strip()
+                            data_text = data.get_text().strip()
+                            
+                            # Map Wikipedia infobox fields to your DataFrame columns
+                            field_mapping = {
+                                'Industry': 'Industry',
+                                'Founded': 'Description',  # May include founding info
+                                'Headquarters': 'Geography',
+                                'Website': 'Website',
+                                'Number of employees': 'Employee Count',
+                                'Type': 'Enterprise Grade Classification',  # Approximation
+                                'Products': 'Software Classification',  # Approximation
+                                'Owner': 'Parent Company',
+                                'Revenue': 'Financial Info'  # Partial info
+                            }
+                            
+                            for wiki_field, df_column in field_mapping.items():
+                                if df_column in self.df.columns and wiki_field in header_text:
+                                    current_value = self.df.loc[index, df_column]
+                                    if pd.isna(current_value) or current_value == self.missing_value_marker:
+                                        self.df.loc[index, df_column] = data_text
+                                        logger.info(f"Updated {df_column} for {company_name} with Wikipedia data")
+                
+            # Also try to find company website directly if missing
+            if 'Website' in self.df.columns:
+                current_website = self.df.loc[index, 'Website']
+                if pd.isna(current_website) or current_website == self.missing_value_marker:
+                    for link in soup.find_all('a'):
+                        href = link.get('href')
+                        if href and '/url?q=' in href:
+                            url = href.split('/url?q=')[1].split('&')[0]
+                            # Check if it's likely a company website (not Wikipedia, social media, etc.)
+                            skip_domains = ['wikipedia.org', 'linkedin.com', 'facebook.com', 'twitter.com', 
+                                          'google.com', 'youtube.com', 'instagram.com']
+                            is_company_site = True
+                            for domain in skip_domains:
+                                if domain in url:
+                                    is_company_site = False
+                                    break
+                            
+                            if is_company_site and company_name.lower().split()[0] in url.lower():
+                                self.df.loc[index, 'Website'] = url
+                                logger.info(f"Updated Website for {company_name} with web scraping")
+                                break
+                
+        except Exception as e:
+            logger.warning(f"Web scraping error for {company_name}: {e}")
+
+
+def main():
+    """Main function to run the enrichment process."""
+    print("=" * 60)
+    print(" SUPABASE COMPANY DATA ENRICHMENT TOOL ".center(60))
+    print("=" * 60)
+    print("This script will enrich your company data from Supabase")
+    print("by filling in missing values using various APIs and web scraping.")
+    print()
+    
+    # Check if required credentials are available
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        print("Error: Supabase credentials not found. Please create a .env file with:")
+        print("SUPABASE_URL=your_supabase_url")
+        print("SUPABASE_KEY=your_supabase_key")
+        return
+    
+    # Check if API keys are available
+    if not CLEARBIT_API_KEY:
+        print("Note: Clearbit API key not found. Some enrichment features will be limited.")
+        print("Create a .env file with CLEARBIT_API_KEY=your_key to enable this feature.")
+    
+    if not ALPHA_VANTAGE_API_KEY:
+        print("Note: Alpha Vantage API key not found. Some enrichment features will be limited.")
+        print("Create a .env file with ALPHA_VANTAGE_API_KEY=your_key to enable this feature.")
+    
+    try:
+        # Create the enricher
+        enricher = CompanyDataEnricher()
+        
+        # Retrieve data from Supabase
+        print("\nRetrieving company data from Supabase...")
+        if not enricher.retrieve_data():
+            print("Error: Failed to retrieve data from Supabase. Please check your credentials and connection.")
+            return
+        
+        # Process the data
+        print("\nProcessing company data...")
+        if not enricher.process_data():
+            print("Error: Failed to process company data.")
+            return
+        
+        # Save to Excel
+        print("\nSaving enriched data to Excel...")
+        output_file = enricher.save_to_excel()
+        if not output_file:
+            print("Error: Failed to save data to Excel.")
+            return
+        
+        # Ask if user wants to update Supabase
+        update_supabase = input("\nDo you want to update the Supabase table with enriched data? (y/n): ")
+        if update_supabase.lower() == 'y':
+            print("\nUpdating Supabase with enriched data...")
+            if enricher.update_supabase():
+                print("Supabase update successful!")
+            else:
+                print("Error: Failed to update Supabase.")
+        
+        print("\nEnrichment process complete!")
+        print(f"Enriched data saved to: {output_file}")
+        print("\nNext steps:")
+        print("1. Review the enriched data for accuracy")
+        print("2. Manually correct any remaining missing values")
+        print("3. Consider running the script again with additional API keys")
+        
+    except Exception as e:
+        print(f"\nError: An unexpected error occurred: {e}")
+
+if __name__ == "__main__":
+    main()
